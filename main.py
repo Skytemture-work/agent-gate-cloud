@@ -9,7 +9,7 @@ app = FastAPI()
 
 # 從 Render 的環境變數或安全檔案讀取設定
 # ⚠️ 注意：Firebase 金鑰我們稍後會使用 Render 的「Secret Files」功能上傳
-CRED_PATH = "/etc/secrets/firebase-key.json" 
+CRED_PATH = "firebase-key.json" 
 
 if os.path.exists(CRED_PATH):
     cred = credentials.Certificate(CRED_PATH)
