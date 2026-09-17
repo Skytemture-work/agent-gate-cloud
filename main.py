@@ -135,7 +135,7 @@ def normalize_plate(raw: str) -> str:
 # ---------------------------------------------------------------------------
 # 3. Google Drive 初始化 (讀取最新照片)
 # ---------------------------------------------------------------------------
-DRIVE_CRED_PATH = os.environ.get("DRIVE_CRED_PATH", "drive-key.json")
+DRIVE_CRED_PATH = os.environ.get("DRIVE_CRED_PATH", "firebase-key.json")
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
