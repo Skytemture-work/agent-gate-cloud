@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+python-multipart
+google-generativeai
+firebase-admin
+paho-mqtt
+google-api-python-client
+google-auth
