@@ -81,7 +81,7 @@ else:
 api_key = os.environ.get("GEMINI_API_KEY")
 ai_client = genai.Client(api_key=api_key) if api_key else None
 
-PLATE_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+PLATE_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
 # 要求 Gemini 只回傳結構化 JSON：是否看得到車牌、車牌文字、信心分數
 PLATE_RESPONSE_SCHEMA = {
