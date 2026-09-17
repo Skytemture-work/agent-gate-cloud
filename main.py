@@ -39,8 +39,18 @@ from google.oauth2 import service_account
 import io
 from googleapiclient.http import MediaIoBaseDownload
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+import sys
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout,
+)
 log = logging.getLogger("gate-agent")
+# 有些部署環境（如 docker/雲端 log 收集器）會把 stdout buffer 起來，
+# 導致 log 延遲很久才出現。這裡強制 unbuffered，讓你能即時看到流程進度。
+for h in log.handlers or logging.getLogger().handlers:
+    h.flush()
 
 app = FastAPI()
 
@@ -101,6 +111,8 @@ def extract_plate_number(image_bytes: bytes, mime_type: str = "image/jpeg") -> d
     if not ai_client:
         raise RuntimeError("Gemini API Key 未設定")
 
+    log.info(f"🤖 Gemini 解析中...（model={PLATE_MODEL}, 圖片大小={len(image_bytes)} bytes）")
+
     response = ai_client.models.generate_content(
         model=PLATE_MODEL,
         contents=[
@@ -114,11 +126,18 @@ def extract_plate_number(image_bytes: bytes, mime_type: str = "image/jpeg") -> d
         ),
     )
     data = json.loads(response.text)
-    return {
+    result = {
         "plate_visible": bool(data.get("plate_visible", False)),
         "plate_number": normalize_plate(data.get("plate_number", "")),
         "confidence": float(data.get("confidence", 0.0)),
     }
+
+    if result["plate_visible"] and result["plate_number"]:
+        log.info(f"✅ Gemini 辨識完成：車牌={result['plate_number']} 信心度={result['confidence']:.2f}")
+    else:
+        log.info(f"⚠️ Gemini 未能辨識出車牌（信心度={result['confidence']:.2f}）")
+
+    return result
 
 
 def normalize_plate(raw: str) -> str:
@@ -135,7 +154,7 @@ def normalize_plate(raw: str) -> str:
 # ---------------------------------------------------------------------------
 # 3. Google Drive 初始化 (讀取最新照片)
 # ---------------------------------------------------------------------------
-DRIVE_CRED_PATH = os.environ.get("DRIVE_CRED_PATH", "firebase-key.json")
+DRIVE_CRED_PATH = os.environ.get("DRIVE_CRED_PATH", "drive-key.json")
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
@@ -160,6 +179,8 @@ def fetch_latest_photo() -> tuple[bytes, str, str]:
     if not DRIVE_FOLDER_ID:
         raise RuntimeError("未設定 DRIVE_FOLDER_ID")
 
+    log.info("📷 正在從 Google Drive 讀取最新照片...")
+
     results = drive_service.files().list(
         q=f"'{DRIVE_FOLDER_ID}' in parents and mimeType contains 'image/' and trashed = false",
         orderBy="createdTime desc",
@@ -182,6 +203,8 @@ def fetch_latest_photo() -> tuple[bytes, str, str]:
     while not done:
         _, done = downloader.next_chunk()
 
+    log.info(f"📷 照片下載完成：{file_info.get('name')} (file_id={file_id})")
+
     return buf.getvalue(), mime_type, file_id
 
 
@@ -192,8 +215,11 @@ def check_authorized(plate: str) -> dict | None:
     """回傳 authorized_vehicles/{plate} 的資料，不存在則回傳 None。"""
     if not firebase_ready:
         raise RuntimeError("Firebase 尚未初始化")
+    log.info(f"🔍 查詢白名單中：authorized_vehicles/{plate}")
     ref = db.reference(f"authorized_vehicles/{plate}")
-    return ref.get()
+    record = ref.get()
+    log.info(f"🔍 白名單查詢結果：{'找到' if record else '不存在'}")
+    return record
 
 
 def decide_action(plate_result: dict) -> tuple[str, str, str | None, dict]:
@@ -275,33 +301,43 @@ def process_gate_event():
     """完整流程：抓照片 -> 辨識車牌 -> 比對白名單 -> 開關門 -> 寫 log。
     這個函式跑在背景執行緒中，允許同步阻塞呼叫。
     """
+    log.info("=" * 60)
+    log.info("🚗 偵測到車輛，開始門禁判斷流程...")
+
     file_id = None
     try:
         image_bytes, mime_type, file_id = fetch_latest_photo()
-        log.info(f"讀取到照片 file_id={file_id}")
 
         plate_result = extract_plate_number(image_bytes, mime_type)
-        log.info(f"辨識結果: {plate_result}")
 
+        log.info("⚖️ 比對白名單、計算最終決策中...")
         action, result, user_id, extra = decide_action(plate_result)
-        log.info(f"決策結果: action={action} result={result} user_id={user_id}")
+
+        emoji = "🟢" if action == "UNLOCK" else "🔴"
+        log.info(f"{emoji} 決策結果：action={action}  result={result}  user_id={user_id}")
 
     except Exception as e:
-        log.exception("gate event 處理失敗")
+        log.exception("❌ gate event 處理失敗，安全起見預設鎖門")
         action, result, user_id, extra = "LOCK", "ERROR", None, {"error": str(e)}
 
     # 無論成功失敗，預設安全動作是 LOCK；只有明確 SUCCESS 才 UNLOCK
     try:
         payload = json.dumps({"action": action.lower()})
+        log.info(f"📡 傳送 MQTT 指令中... topic={DOOR_TOPIC} payload={payload}")
         mqtt_client.publish(DOOR_TOPIC, payload)
-        log.info(f"MQTT publish {DOOR_TOPIC}: {payload}")
+        log.info("📡 MQTT 指令已送出")
     except Exception as e:
-        log.error(f"MQTT publish 失敗: {e}")
+        log.error(f"📡 MQTT publish 失敗: {e}")
 
     try:
+        log.info("📝 寫入 Firebase door_access_logs 中...")
         write_access_log(action, result, user_id, extra, file_id=file_id)
+        log.info("📝 Log 寫入完成")
     except Exception as e:
-        log.error(f"寫入 log 失敗: {e}")
+        log.error(f"📝 寫入 log 失敗: {e}")
+
+    log.info("✅ 本次流程結束，繼續監聽 car topic...")
+    log.info("=" * 60)
 
 
 def on_car_message(client, userdata, msg):
@@ -311,6 +347,8 @@ def on_car_message(client, userdata, msg):
     except ValueError:
         log.warning(f"car topic 收到非數字訊息: {msg.payload!r}")
         return
+
+    log.info(f"📨 收到 car topic 訊息，目前數值={value}")
 
     with _last_car_count_lock:
         if _last_car_count is None:
