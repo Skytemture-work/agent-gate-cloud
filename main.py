@@ -37,7 +37,10 @@ import paho.mqtt.client as mqtt
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 import io
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import (
+    MediaIoBaseDownload,
+    MediaIoBaseUpload,
+)
 
 import sys
 
@@ -156,7 +159,7 @@ def normalize_plate(raw: str) -> str:
 # ---------------------------------------------------------------------------
 DRIVE_CRED_PATH = os.environ.get("DRIVE_CRED_PATH", "drive-key.json")
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
-DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 drive_service = None
 if os.path.exists(DRIVE_CRED_PATH):
@@ -395,52 +398,291 @@ API_KEY = os.environ.get("AGENT_API_KEY")
 
 def require_api_key(x_api_key: str = Header(default=None)):
     if not API_KEY:
-        # 沒設定 API_KEY 的話，代表你還在本機測試；正式部署務必設定這個環境變數
-        log.warning("AGENT_API_KEY 未設定，/api/manual-verify 目前沒有驗證！")
+        # 沒設定 API_KEY 的話，代表你還在本機測試；
+        # 正式部署務必設定這個環境變數
+        log.warning(
+            "AGENT_API_KEY 未設定，目前 API 沒有驗證！"
+        )
         return
+
     if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="無效的 API Key")
+        raise HTTPException(
+            status_code=401,
+            detail="無效的 API Key"
+        )
 
 
-@app.post("/api/manual-verify", dependencies=[Depends(require_api_key)])
-async def manual_verify(file: UploadFile = File(...)):
-    """手動上傳照片測試辨識+決策流程，不透過 MQTT/Drive 觸發，方便除錯。"""
-    if not ai_client:
-        raise HTTPException(status_code=500, detail="Gemini API Key 未設定")
+# ---------------------------------------------------------------------------
+# ESP32 → Render → Google Drive
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/api/upload-photo",
+    dependencies=[Depends(require_api_key)]
+)
+async def upload_photo(
+    file: UploadFile = File(...)
+):
+    """
+    ESP32 上傳 JPEG 照片。
+
+    流程：
+        ESP32
+          ↓
+        Render /api/upload-photo
+          ↓
+        Google Drive
+          ↓
+        回傳成功
+    """
+
+    # ---------------------------------------------------------
+    # 1. 確認 Google Drive 已初始化
+    # ---------------------------------------------------------
+
+    if not drive_service:
+        raise HTTPException(
+            status_code=500,
+            detail="Google Drive 尚未初始化"
+        )
+
+    if not DRIVE_FOLDER_ID:
+        raise HTTPException(
+            status_code=500,
+            detail="DRIVE_FOLDER_ID 未設定"
+        )
+
+
+    # ---------------------------------------------------------
+    # 2. 確認檔案類型
+    # ---------------------------------------------------------
+
+    content_type = file.content_type or "image/jpeg"
+
+    if not content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=400,
+            detail="只接受圖片檔案"
+        )
+
+
+    # ---------------------------------------------------------
+    # 3. 讀取 ESP32 上傳的圖片
+    # ---------------------------------------------------------
 
     image_bytes = await file.read()
+
+    if not image_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="收到空的圖片檔案"
+        )
+
+
+    # 最大 8MB
     if len(image_bytes) > 8 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="檔案過大（上限 8MB）")
-    if not (file.content_type or "").startswith("image/"):
-        raise HTTPException(status_code=400, detail="只接受圖片檔案")
+        raise HTTPException(
+            status_code=413,
+            detail="檔案過大（上限 8MB）"
+        )
+
+
+    log.info(
+        f"📤 收到 ESP32 圖片："
+        f"name={file.filename}, "
+        f"size={len(image_bytes)} bytes, "
+        f"type={content_type}"
+    )
+
+
+    # ---------------------------------------------------------
+    # 4. 建立 Google Drive 檔名
+    # ---------------------------------------------------------
+
+    timestamp = datetime.now(timezone.utc).strftime(
+        "%Y%m%d_%H%M%S_%f"
+    )
+
+    filename = (
+        f"esp32_{timestamp}.jpg"
+    )
+
+
+    # ---------------------------------------------------------
+    # 5. 建立 Drive metadata
+    # ---------------------------------------------------------
+
+    file_metadata = {
+        "name": filename,
+        "parents": [DRIVE_FOLDER_ID],
+    }
+
+
+    # ---------------------------------------------------------
+    # 6. 將圖片上傳到 Google Drive
+    # ---------------------------------------------------------
 
     try:
-        plate_result = extract_plate_number(image_bytes, file.content_type or "image/jpeg")
-        action, result, user_id, extra = decide_action(plate_result)
-        write_access_log(action, result, user_id, extra, file_id="manual-upload")
+
+        media = MediaIoBaseUpload(
+            io.BytesIO(image_bytes),
+            mimetype=content_type,
+            resumable=False,
+        )
+
+        uploaded_file = drive_service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id,name,mimeType,createdTime",
+        ).execute()
+
+    except Exception as e:
+
+        log.exception(
+            "❌ Google Drive 上傳失敗"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Google Drive 上傳失敗: {str(e)}"
+        )
+
+
+    # ---------------------------------------------------------
+    # 7. 回傳 ESP32
+    # ---------------------------------------------------------
+
+    file_id = uploaded_file.get("id")
+
+    log.info(
+        f"✅ Google Drive 上傳成功："
+        f"name={uploaded_file.get('name')}, "
+        f"file_id={file_id}"
+    )
+
+
+    return {
+        "status": "success",
+        "message": "照片已成功上傳到 Google Drive",
+        "file_id": file_id,
+        "filename": uploaded_file.get("name"),
+        "mime_type": uploaded_file.get("mimeType"),
+        "created_time": uploaded_file.get("createdTime"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 手動測試：上傳照片 → Gemini → Firebase → 決策
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/api/manual-verify",
+    dependencies=[Depends(require_api_key)]
+)
+async def manual_verify(
+    file: UploadFile = File(...)
+):
+    """
+    手動上傳照片測試辨識+決策流程，
+    不透過 MQTT/Drive 觸發。
+    """
+
+    if not ai_client:
+        raise HTTPException(
+            status_code=500,
+            detail="Gemini API Key 未設定"
+        )
+
+    image_bytes = await file.read()
+
+    if len(image_bytes) > 8 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="檔案過大（上限 8MB）"
+        )
+
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(
+            status_code=400,
+            detail="只接受圖片檔案"
+        )
+
+    try:
+
+        plate_result = extract_plate_number(
+            image_bytes,
+            file.content_type or "image/jpeg"
+        )
+
+        action, result, user_id, extra = decide_action(
+            plate_result
+        )
+
+        write_access_log(
+            action,
+            result,
+            user_id,
+            extra,
+            file_id="manual-upload"
+        )
+
         return {
             "status": "success",
             "plate_result": plate_result,
             "action": action.lower(),
             "result": result,
         }
+
     except Exception:
-        log.exception("manual_verify 失敗")
-        raise HTTPException(status_code=500, detail="伺服器內部錯誤，請查看伺服器日誌")
+
+        log.exception(
+            "manual_verify 失敗"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="伺服器內部錯誤，請查看伺服器日誌"
+        )
 
 
-@app.post("/api/trigger", dependencies=[Depends(require_api_key)])
+# ---------------------------------------------------------------------------
+# 手動觸發完整流程
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/api/trigger",
+    dependencies=[Depends(require_api_key)]
+)
 async def manual_trigger():
-    """手動觸發一次完整流程（等同於收到 car topic 數字變化）。"""
-    executor.submit(process_gate_event)
-    return {"status": "triggered"}
 
+    """
+    手動觸發一次完整流程，
+    等同於收到 car topic 數字變化。
+    """
+
+    executor.submit(
+        process_gate_event
+    )
+
+    return {
+        "status": "triggered"
+    }
+
+
+# ---------------------------------------------------------------------------
+# Health Check
+# ---------------------------------------------------------------------------
 
 @app.get("/")
 def health_check():
+
     return {
         "status": "Agent Gate Server is running",
         "firebase_ready": firebase_ready,
         "drive_ready": drive_service is not None,
-        "mqtt_connected": mqtt_client.is_connected() if clean_host else False,
+        "mqtt_connected": (
+            mqtt_client.is_connected()
+            if clean_host
+            else False
+        ),
     }
